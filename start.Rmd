@@ -1,0 +1,227 @@
+---
+title: "commonlit eda"
+author: "Anthony"
+date: "6/18/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(tidytext)
+library(textrecipes)
+library(qdap)
+library(udpipe)
+library(lexicon)
+library(word.lists)
+colnames(read_csv("./data/test.csv"))
+
+theme_set(theme_minimal())
+```
+
+
+```{r}
+list.files("./data")
+
+base <- read_csv(unzip("./data/train.csv.zip"))
+```
+
+### Glimpses at data
+
+Check how big it is
+
+```{r}
+dim(base)
+```
+
+Check how many complete fields there are
+
+```{r}
+nrow(na.omit(base))
+```
+
+Check sources
+
+```{r}
+base %>% count(url_legal) %>% count(n)
+```
+
+The vast majority of sources only have 1 document - the vast majority have none.
+
+Let's check about licenses, though it is presumably the same story.
+
+
+```{r}
+base %>% count(license) %>% count(n)
+```
+
+Not quite, but regardless, that is extremely unlikely to have any relevance.
+
+### Split
+
+
+```{r}
+set.seed(5678)
+split <- initial_split(base, strata = target)
+train <- training(split)
+test <- testing(split)
+```
+
+
+### Text
+
+
+```{r}
+hist(train$target)
+hist(train$standard_error)
+
+train %>% 
+  ggplot(aes(x = standard_error, y = target))+
+  geom_point()
+```
+
+
+Interesting. Not sure what to do with that, but it seems fairly normal for things further deviated from the center to have larger standard errors.
+
+
+```{r}
+train %>% 
+  mutate(len = length(target)) %>%
+  distinct(len)
+```
+OK, so all of the excerpts are exactly the same length - they must be expecting some `keras` models or whatever to be the most performant
+
+Let's have a glimpse at the sources, even though it would probably not be wise to use them for any broader-sense of anything.
+
+
+```{r}
+train %>% 
+  filter(!is.na(url_legal)) %>%
+  separate_rows(url_legal, sep = "/") %>%
+  filter(nchar(url_legal) > 1, !str_detect(url_legal, "http"), url_legal != "wiki") %>%
+  count(url_legal,sort= T) 
+
+```
+Ah ok, so there might be something to it - at lesat we know that there is a significant chunk from simple wikipedia, wikipedia, and some fiction sites. That is useful
+
+frontiersin.org:
+
+> science for kids, edited by kids
+
+just check some details about these popular sites
+
+```{r}
+train %>% 
+  filter(!is.na(url_legal)) %>%
+  mutate(url = url_legal) %>%
+  separate_rows(url_legal, sep = "/") %>%
+  filter(nchar(url_legal) > 1, !str_detect(url_legal, "http"), url_legal != "wiki") %>%
+  count(url_legal,sort= T) %>%
+  head(6) %>%
+  left_join(train %>% 
+              filter(!is.na(url_legal)) %>%
+              mutate(url = url_legal) %>%
+              separate_rows(url_legal, sep = "/")) %>%
+  ggplot(aes(x = target, fill = url_legal))+
+  geom_histogram(alpha = .5, bins = 20, show.legend = FALSE)+
+  facet_wrap(~url_legal)+
+  labs(title = "Scores of main url sources",
+       y = NULL,
+       x = NULL)
+```
+
+very interesting... africanstorybook.org skews the most difficult, though the sample size is fairly small
+
+what in the world is 10.3389? sounds like it should be a doi or something, but it skews pretty low?
+
+```{r}
+train %>% filter(str_detect(url_legal, "10.3389")) %>% select(url_legal, excerpt)
+```
+
+AHHHHHHHhh OK it is part of frontiersin.org - must be one of the categories (the only one sampled?)
+
+AHHHHH double ok - there are 3 147s after doing that count - they are all elements of the same thing
+
+Let's try one other simple url cleaning thing to double check
+
+```{r}
+train %>%
+  # filter(!is.na(url_legal)) %>%
+  mutate(short_url = str_remove(url_legal, "https?:\\/\\/") %>% str_remove("/.*") %>% fct_lump(n = 4)) %>%
+  ggplot(aes(x = target, fill = short_url, colour = short_url))+
+  geom_histogram(alpha = .1,  bins = 20, show.legend = FALSE)+
+  facet_wrap(~short_url)
+```
+
+- normal distribution
+- simple wikipedia is lower than regular wikipedia?
+  - means the target is the opposite of what you might expect?
+  
+
+
+### Look at the text
+
+```{r}
+train %>% 
+  arrange(target) %>%
+  head(10) %>%
+  pull(excerpt)
+```
+
+
+okay, so the most "difficult" really do look like standard "high-level" language at a glance
+
+```{r}
+train %>% 
+  arrange(-target) %>%
+  head(10) %>%
+  pull(excerpt)
+```
+
+...and the "easiest" ones also look straightforwardly straightforward. That is certainly good.
+
+
+Have a look at the "formality" scores:
+
+```
+formal <-
+  train %>%
+  arrange(target) %>%
+  head(20) %>%
+  bind_rows(
+    train %>%
+      arrange(-target) %>%
+      head(20)
+  ) %>%
+  mutate(formal = map_dbl(excerpt, ~formality(.x)$formality$formality)) 
+
+
+formal %>% 
+  ggplot(aes(x = formal, y = target)) + 
+  geom_point()
+```
+
+```{r}
+piped <- train %>% 
+  mutate(doc_id = id, text = excerpt) %>%
+  udpipe(object = "english", parallel.cores = 4 ) 
+
+
+piped %>% 
+  mutate(lem = textstem::lemmatize_words(token))%>%
+  left_join(list_ngsl_all, by = c("lem" = "lemma")) %>% view
+  filter(is.na(group) & !upos %in% c("PUNCT", "PROPN")) %>% 
+  select(token, lem, lemma, upos) %>%
+  filter(upos == "NOUN") %>%
+  # count(upos, sort = TRUE)
+  sample_n(10)
+
+list_ngsl_all %>% view
+
+```
