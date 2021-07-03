@@ -20,6 +20,10 @@ library(qdap)
 library(udpipe)
 library(lexicon)
 library(word.lists)
+library(textstem)
+
+
+wikimorphemes <- readRDS("~/Documents/kaggle_commonlit/wikimorphemes.rds")
 colnames(read_csv("./data/test.csv"))
 
 theme_set(theme_minimal())
@@ -51,8 +55,7 @@ Check sources
 ```{r}
 base %>% count(url_legal) %>% count(n)
 ```
-
-The vast majority of sources only have 1 document - the vast majority have none.
+A significant majority that have sources only have 1 document, but the vast majority have none.
 
 Let's check about licenses, though it is presumably the same story.
 
@@ -63,6 +66,9 @@ base %>% count(license) %>% count(n)
 
 Not quite, but regardless, that is extremely unlikely to have any relevance.
 
+
+So yeah, we really only have the text data to work from.
+
 ### Split
 
 
@@ -71,6 +77,9 @@ set.seed(5678)
 split <- initial_split(base, strata = target)
 train <- training(split)
 test <- testing(split)
+
+
+folds <- vfold_cv(train, 5)
 ```
 
 
@@ -95,7 +104,7 @@ train %>%
   mutate(len = length(target)) %>%
   distinct(len)
 ```
-OK, so all of the excerpts are exactly the same length - they must be expecting some `keras` models or whatever to be the most performant
+OK, so all of the excerpts are exactly the same length - they must be expecting some `keras` models or whatever that encodes everything with the same length to be the most performant
 
 Let's have a glimpse at the sources, even though it would probably not be wise to use them for any broader-sense of anything.
 
@@ -152,7 +161,7 @@ Let's try one other simple url cleaning thing to double check
 
 ```{r}
 train %>%
-  # filter(!is.na(url_legal)) %>%
+  filter(!is.na(url_legal)) %>%
   mutate(short_url = str_remove(url_legal, "https?:\\/\\/") %>% str_remove("/.*") %>% fct_lump(n = 4)) %>%
   ggplot(aes(x = target, fill = short_url, colour = short_url))+
   geom_histogram(alpha = .1,  bins = 20, show.legend = FALSE)+
@@ -162,6 +171,7 @@ train %>%
 - normal distribution
 - simple wikipedia is lower than regular wikipedia?
   - means the target is the opposite of what you might expect?
+  - kids frontier stuff is also on the high-end, so that figures
   
 
 
@@ -175,7 +185,7 @@ train %>%
 ```
 
 
-okay, so the most "difficult" really do look like standard "high-level" language at a glance
+okay, so the most "difficult" really do look like standard "high-level" language at a glance - lots of technical stuff, lots of long sentences, lots of latin/greek-y words
 
 ```{r}
 train %>% 
@@ -184,22 +194,23 @@ train %>%
   pull(excerpt)
 ```
 
-...and the "easiest" ones also look straightforwardly straightforward. That is certainly good.
+...and the "easiest" ones also look straightforwardly straightforward. That is certainly good. They seem to be narratives as well, which is kinda interesting.
 
 
 Have a look at the "formality" scores:
 
-```
+``` {r}
+formality_sf <- safely(formality)
 formal <-
   train %>%
   arrange(target) %>%
-  head(20) %>%
+  head(23) %>%
   bind_rows(
     train %>%
       arrange(-target) %>%
-      head(20)
+      head(30)
   ) %>%
-  mutate(formal = map_dbl(excerpt, ~formality(.x)$formality$formality)) 
+  mutate(formal = map_dbl(excerpt, ~formality(.x)$result$formality$formality)) 
 
 
 formal %>% 
@@ -213,15 +224,104 @@ piped <- train %>%
   udpipe(object = "english", parallel.cores = 4 ) 
 
 
-piped %>% 
-  mutate(lem = textstem::lemmatize_words(token))%>%
-  left_join(list_ngsl_all, by = c("lem" = "lemma")) %>% view
-  filter(is.na(group) & !upos %in% c("PUNCT", "PROPN")) %>% 
-  select(token, lem, lemma, upos) %>%
-  filter(upos == "NOUN") %>%
+joined_piped <-
+  piped %>% 
   # count(upos, sort = TRUE)
-  sample_n(10)
+  mutate(lem = lemmatize_words(token))%>%
+  left_join(list_ngsl_all, by = c("lem" = "lemma"))
 
-list_ngsl_all %>% view
+joined_piped %>%
+    # filter(upos == "NOUN") %>%
+  mutate(pos_fac = fct_lump(upos, prop = .05)) %>%
+  # count(pos_fac) 
+  ggplot(aes(x = group, fill = pos_fac))+
+  geom_histogram()+
+  facet_wrap(~pos_fac)
+
 
 ```
+
+so it looks like nouns have the nicest spread of "difficulty"  - that makes sense
+
+
+
+```{r}
+piped_summaries <- 
+  joined_piped %>% 
+  filter(!upos %in% c("PUNCT")) %>%
+  mutate(group = if_else(is.na(group), 1L, group)) %>%
+  mutate(word_len = nchar(token)) %>%
+  # mutate(sent_len = nchar(sentence)) %>%
+  group_by(doc_id) %>%
+  summarise(word_count = n(), 
+            word_length = mean(word_len, na.rm = TRUE),
+            sent_count = max(sentence_id, na.rm = TRUE),
+            avg_word_diff = mean(group, na.rm = TRUE),
+            ) %>%
+  left_join(train, by = c("doc_id" = "id")) %>%
+  ungroup()
+
+
+
+piped_summaries %>% 
+  ggplot(aes(x = target, y = avg_word_diff)) +
+  geom_point()+
+  geom_smooth()
+  
+  
+  
+piped_summaries %>% 
+  arrange(-avg_word_diff) %>% 
+  head(1) %>%
+  select(doc_id, avg_word_diff, target) %>%
+  left_join(train) %>% 
+  pull(excerpt)
+
+```
+
+I have a feeling that these skew hard = academic. What is a proxy for academic language? Try prefixes/suffixes?
+
+
+
+```{r}
+# devtools::install_github("jonthegeek/wikimorphemes")
+
+library(wikimorphemes)
+
+piped %>%
+  head(10) %>%
+  mutate(morph = map(token, ~process))
+```
+
+
+
+```{r}
+mets <- metric_set(rmse)
+rec <- recipe(target ~ excerpt, data = train) %>%
+  step_tokenize(excerpt) %>%
+  step_stopwords(excerpt) %>%
+  # step_ngram(excerpt, num_tokens = 3, min_num_tokens = 2) %>%
+  step_tokenfilter(excerpt, max_tokens = 250) %>%
+  step_tf(excerpt)
+
+mod <- linear_reg() %>% set_engine("lm")
+
+
+wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(mod)
+
+res <- wf %>%
+  fit_resamples(
+    resamples = folds,
+    control = control_resamples(save_pred = TRUE)
+  )
+
+
+collect_metrics(res)
+res$.notes[[1]] %>% pull(.notes)
+```
+
+
+
+
